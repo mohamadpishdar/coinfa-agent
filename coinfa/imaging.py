@@ -6,6 +6,7 @@ Layout (from assets/template.jpg, 864x1080, rendered at 1080x1350):
   - below the line: a photo related to the story, cover-cropped
 """
 import io
+import time
 import logging
 
 import arabic_reshaper
@@ -106,12 +107,22 @@ def _openverse(query: str) -> tuple[Image.Image | None, str]:
     """Keyless: CC0 / public-domain / CC BY photos from openverse.org.
     CC BY needs credit, which we return and add to the caption."""
     try:
-        r = requests.get("https://api.openverse.org/v1/images/",
-                         params={"q": query[:100], "license": "cc0,pdm,by",
-                                 "aspect_ratio": "tall,square", "size": "large",
-                                 "page_size": 10, "mature": "false"},
-                         headers={"User-Agent": "CoinFaNewsBot/1.0"}, timeout=25)
-        results = r.json().get("results", [])
+        results = None
+        for _ in range(3):                      # the API sometimes answers 504
+            try:
+                r = requests.get("https://api.openverse.org/v1/images/",
+                                 params={"q": query[:100], "license": "cc0,pdm,by",
+                                         "page_size": 10},
+                                 headers={"User-Agent": "CoinFaNewsBot/1.0"}, timeout=25)
+            except requests.RequestException:
+                time.sleep(3)
+                continue
+            if r.ok:
+                results = r.json().get("results", [])
+                break
+            time.sleep(3)
+        if results is None:
+            return None, ""
         if not results:
             words = query.split()
             return _openverse(" ".join(words[:-1])) if len(words) > 1 else (None, "")
