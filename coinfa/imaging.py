@@ -24,6 +24,8 @@ LINE_Y = int(197 * S)            # first row under the golden line
 TITLE_BOX = (int(228 * S), int(14 * S), W - int(26 * S), int(186 * S))
 FONT_BOLD = str(ASSETS / "Vazirmatn-Black.ttf")
 GOLD = (233, 196, 120)
+SAFE_SCALE = 0.86                # design scaled to 86% -> ~75px side margin
+BG = (6, 14, 25)                 # template's dark navy, used for the margin
 
 
 from PIL import features
@@ -214,5 +216,10 @@ def compose(headline: str, photo: Image.Image | None, out_path, tag: str = "") -
         md.line([(0, i), (W, i)], fill=int(120 + 135 * i / 40))
     base.paste(ph, (0, LINE_Y), mask)
     _draw_headline(base, headline)
-    base.save(out_path, "JPEG", quality=92, optimize=True)
+    # Instagram's profile grid crops 4:5 posts to 3:4 (~34px off each side), so
+    # shrink the whole design into a centred safe area on a dark canvas.
+    sw, sh = int(W * SAFE_SCALE), int(H * SAFE_SCALE)
+    canvas = Image.new("RGB", (W, H), BG)
+    canvas.paste(base.resize((sw, sh), Image.LANCZOS), ((W - sw) // 2, (H - sh) // 2))
+    canvas.save(out_path, "JPEG", quality=92, optimize=True)
     return str(out_path)
