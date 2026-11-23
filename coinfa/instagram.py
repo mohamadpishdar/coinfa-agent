@@ -13,19 +13,20 @@ from . import storage
 from .config import IG_ACCESS_TOKEN, IG_API_VERSION, IG_USER_ID, IMGBB_API_KEY
 
 log = logging.getLogger(__name__)
-# Instagram-Login tokens (IGAA...) use graph.instagram.com; Facebook-Login
-# tokens (EAA...) use graph.facebook.com with the linked IG business account.
-_FB = IG_ACCESS_TOKEN.startswith("EAA")
-BASE = f"https://graph.{'facebook' if _FB else 'instagram'}.com/{IG_API_VERSION}"
+
+
+def _base(token: str) -> str:
+    # Facebook-type tokens (EAA...) from "Unified login" apps use graph.facebook.com;
+    # Instagram-login tokens (IG...) use graph.instagram.com.
+    host = "graph.facebook.com" if token.startswith("EAA") else "graph.instagram.com"
+    return f"https://{host}/{IG_API_VERSION}"
 
 
 def _token() -> str:
     """Use the stored refreshed token if we have one; refresh every ~50 days."""
-    if _FB:                       # Facebook tokens: use as given (no IG refresh)
-        return IG_ACCESS_TOKEN
     t = storage.get("ig_token") or IG_ACCESS_TOKEN
     last = storage.get("ig_token_refreshed", 0)
-    if time.time() - last > 50 * 86400:
+    if not t.startswith("EAA") and time.time() - last > 50 * 86400:
         try:
             r = requests.get("https://graph.instagram.com/refresh_access_token",
                              params={"grant_type": "ig_refresh_token",
@@ -55,6 +56,7 @@ def publish(image_path: str, caption: str) -> str:
 
 def publish_url(url: str, caption: str) -> str:
     token = _token()
+    BASE = _base(token)
     r = requests.post(f"{BASE}/{IG_USER_ID}/media",
                       data={"image_url": url, "caption": caption,
                             "access_token": token}, timeout=60)
