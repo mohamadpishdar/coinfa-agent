@@ -10,7 +10,7 @@ import requests
 
 from . import storage
 from .config import (FEEDS_CRYPTO, FEEDS_BOURSE, FEEDS_MARKET,
-                     MAX_NEWS_AGE_HOURS)
+                     MAX_NEWS_AGE_HOURS, MEME_COINS)
 
 log = logging.getLogger(__name__)
 logging.getLogger("trafilatura").setLevel(logging.CRITICAL)
@@ -24,13 +24,19 @@ class Item:
     link: str
     summary: str
     published: float
-    category: str = "crypto"   # "crypto", "bourse", "market"
+    category: str = "crypto"   # "crypto", "bourse", "market", "meme"
     body: str = ""
 
 
 def _clean(html: str) -> str:
     txt = re.sub(r"<[^>]+>", " ", html or "")
     return re.sub(r"\s+", " ", txt).strip()
+
+
+def _is_memecoin(title: str, summary: str) -> bool:
+    """Check if a crypto article is about memecoins."""
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in MEME_COINS)
 
 
 def _collect_feeds(feed_list: list[tuple[str, str]], category: str,
@@ -64,6 +70,12 @@ def collect() -> list[Item]:
     bourse = _collect_feeds(FEEDS_BOURSE, "bourse", cutoff)
     market = _collect_feeds(FEEDS_MARKET, "market", cutoff)
 
+    # Split memecoins out of crypto
+    meme = [it for it in crypto if _is_memecoin(it.title, it.summary)]
+    crypto = [it for it in crypto if not _is_memecoin(it.title, it.summary)]
+    for it in meme:
+        it.category = "meme"
+
     # Filter market items: keep only those about gold/housing/car/silver
     market_kw = re.compile(
         r"طلا|سکه|نقره|مسکن|خانه|آپارتمان|خودرو|پراید|تیبا|دنا|ساینا|پژو|"
@@ -72,11 +84,11 @@ def collect() -> list[Item]:
     )
     market = [it for it in market if market_kw.search(it.title + " " + it.summary)]
 
-    all_items = crypto + bourse + market
+    all_items = crypto + bourse + market + meme
     all_items.sort(key=lambda i: i.published, reverse=True)
 
-    log.info("collected %d crypto, %d bourse, %d market items",
-             len(crypto), len(bourse), len(market))
+    log.info("collected %d crypto, %d bourse, %d market, %d meme items",
+             len(crypto), len(bourse), len(market), len(meme))
     return all_items
 
 
