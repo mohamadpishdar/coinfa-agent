@@ -95,7 +95,6 @@ def full_caption(post: dict, credit: str = "") -> str:
     parts = [post["caption"].strip()]
     if kw:
         parts.append(f"🔎 {kw}")
-    parts.append("⚠️ این پست صرفاً خبری است و توصیه‌ی مالی نیست.")
     if credit:
         parts.append(f"📷 {credit}")
     parts.append(" ".join(post["hashtags"]))
