@@ -40,7 +40,7 @@ IG_USER_ID = env("IG_USER_ID")
 IG_ACCESS_TOKEN = env("IG_ACCESS_TOKEN")
 IG_API_VERSION = env("IG_API_VERSION", "v23.0")
 
-DAILY_POSTS = int(env("DAILY_POSTS", "6"))
+DAILY_POSTS = int(env("DAILY_POSTS", "7"))
 MAX_NEWS_AGE_HOURS = int(env("MAX_NEWS_AGE_HOURS", "24"))
 CHECK_EVERY_MINUTES = int(env("CHECK_EVERY_MINUTES", "30"))
 BRAND_HASHTAG = env("BRAND_HASHTAG", "#کوین_فا_نیوز")
@@ -49,6 +49,13 @@ BRAND_HASHTAG = env("BRAND_HASHTAG", "#کوین_فا_نیوز")
 QUOTA_CRYPTO = int(env("QUOTA_CRYPTO", "3"))
 QUOTA_BOURSE = int(env("QUOTA_BOURSE", "2"))
 QUOTA_MARKET = int(env("QUOTA_MARKET", "1"))  # housing, gold, car, silver
+QUOTA_MEME = int(env("QUOTA_MEME", "1"))      # memecoin news (optional, 0-1)
+
+# --- Instagram algorithm: staggered publishing ---
+# Optimal posting hours in user's timezone (Europe/Brussels)
+# Posts are spread across these slots, max 1 per check cycle
+IG_POST_GAP_MINUTES = int(env("IG_POST_GAP_MINUTES", "120"))  # min gap between posts
+IG_OPTIMAL_HOURS = [9, 12, 15, 17, 19, 21]  # best engagement hours
 
 # --- Crypto feeds (international, English) ---
 FEEDS_CRYPTO = [
@@ -77,6 +84,13 @@ FEEDS_MARKET = [
     ("ایرنا اقتصادی", "https://www.irna.ir/rss/tp/1018"),
     ("ایسنا", "https://www.isna.ir/rss"),
 ]
+
+# --- Memecoin keywords for filtering from crypto feeds ---
+MEME_COINS = {
+    "doge", "dogecoin", "shib", "shiba", "pepe", "floki", "bonk", "wif",
+    "dogwifhat", "brett", "mog", "popcat", "neiro", "turbo", "memecoin",
+    "meme coin", "meme token", "dog coin", "frog coin",
+}
 
 # Legacy flat list (keep for backwards compat)
 FEEDS = FEEDS_CRYPTO
