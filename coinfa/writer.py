@@ -5,7 +5,8 @@ import re
 
 import requests
 
-from .config import ANTHROPIC_API_KEY, BRAND_HASHTAG, CLAUDE_MODEL
+from .config import (ANTHROPIC_API_KEY, BRAND_HASHTAG, CLAUDE_MODEL,
+                     QUOTA_CRYPTO, QUOTA_BOURSE, QUOTA_MARKET)
 
 log = logging.getLogger(__name__)
 
@@ -31,30 +32,71 @@ def _json(text: str):
     return json.loads(m.group(1) if m else text)
 
 
-def pick(items, n: int) -> list[int]:
-    """Return indexes of the n most important, non-duplicate stories."""
-    if len(items) <= n:
-        return list(range(len(items)))
-    lst = "\n".join(f"{i}. [{it.source}] {it.title} — {it.summary[:200]}"
-                    for i, it in enumerate(items[:80]))
+def _pick_category(items, category: str, n: int) -> list[int]:
+    """Pick top n items from a specific category. Returns global indexes."""
+    if n <= 0:
+        return []
+    cat_items = [(i, it) for i, it in enumerate(items) if it.category == category]
+    if not cat_items:
+        return []
+    if len(cat_items) <= n:
+        return [i for i, _ in cat_items]
+
+    lst = "\n".join(f"{j}. [{it.source}] {it.title} — {it.summary[:200]}"
+                    for j, (i, it) in enumerate(cat_items))
+
+    if category == "crypto":
+        role = ("You are the news editor of a Persian crypto news Instagram page. "
+                "Pick stories with real news value for Persian-speaking crypto users: "
+                "market-moving events, regulation, major projects, hacks/security, "
+                "big-company adoption. Skip sponsored posts, price-prediction fluff, "
+                "press releases, and several articles about the same story (keep one).")
+    elif category == "bourse":
+        role = ("You are the news editor of a Persian financial news page. "
+                "Pick the most important stories about Tehran Stock Exchange (بورس تهران), "
+                "TEDPIX index moves, major IPOs, big trades, regulatory changes, "
+                "and notable sector moves. Skip duplicate stories and opinion pieces.")
+    else:  # market
+        role = ("You are the news editor of a Persian financial news page. "
+                "Pick stories about Iran's housing market (مسکن), gold & coin prices (طلا و سکه), "
+                "car market (خودرو), or silver (نقره). Focus on price changes, "
+                "government policy, and market-moving news. Skip opinion and analysis.")
+
     out = _claude(
-        "You are the news editor of a Persian crypto news Instagram page. "
-        "Pick stories with real news value for Persian-speaking crypto users: "
-        "market-moving events, regulation, major projects, hacks/security, "
-        "big-company adoption. Skip sponsored posts, price-prediction fluff, "
-        "press releases, and several articles about the same story (keep one).",
+        role,
         f"Choose the {n} best stories. Reply with ONLY a JSON array of their "
         f"numbers, most important first.\n\n{lst}", 200)
     try:
-        idx = [int(i) for i in _json(out) if 0 <= int(i) < len(items)]
-        return list(dict.fromkeys(idx))[:n]
+        local_idx = [int(i) for i in _json(out) if 0 <= int(i) < len(cat_items)]
+        local_idx = list(dict.fromkeys(local_idx))[:n]
+        return [cat_items[j][0] for j in local_idx]
     except Exception:
-        log.warning("pick parse failed: %s", out[:200])
-        return list(range(n))
+        log.warning("pick parse failed for %s: %s", category, out[:200])
+        return [i for i, _ in cat_items[:n]]
 
 
-SYSTEM_WRITER = f"""تو سردبیر و نویسنده‌ی پیج خبری «کوین فا نیوز» هستی. خبرهای انگلیسی رمزارز را
+def pick(items, n: int) -> list[int]:
+    """Return indexes of the n most important stories, respecting category quotas."""
+    crypto_idx = _pick_category(items, "crypto", QUOTA_CRYPTO)
+    bourse_idx = _pick_category(items, "bourse", QUOTA_BOURSE)
+    market_idx = _pick_category(items, "market", QUOTA_MARKET)
+
+    result = crypto_idx + bourse_idx + market_idx
+
+    # If some categories had fewer items, fill from crypto
+    if len(result) < n:
+        used = set(result)
+        extras = [i for i, it in enumerate(items)
+                  if i not in used and it.category == "crypto"]
+        result.extend(extras[:n - len(result)])
+
+    return result[:n]
+
+
+SYSTEM_WRITER = f"""تو سردبیر و نویسنده‌ی پیج خبری «کوین فا نیوز» هستی. خبرها را
 به فارسیِ روان، خودمانی و کاملاً انسانی بازنویسی می‌کنی؛ طوری که هیچ‌کس نفهمد ترجمه یا متن ماشینی است.
+
+اگر خبر به زبان فارسی است، آن را بازنویسی و خلاصه کن (ترجمه نکن). اگر انگلیسی است، به فارسی روان بنویس.
 
 قواعد قطعی:
 - ترجمه‌ی کلمه‌به‌کلمه ممنوع. مثل یک آدم که خبر را خوانده و برای دوستش تعریف می‌کند بنویس.
@@ -63,7 +105,9 @@ SYSTEM_WRITER = f"""تو سردبیر و نویسنده‌ی پیج خبری «�
 - عدد، نام، تاریخ و مبلغ را دقیقاً مطابق متن اصلی بیاور؛ چیزی از خودت اضافه نکن و حدس نزن.
 - هیچ توصیه‌ی خرید/فروش، سیگنال، «الان وقت خریده» یا وعده‌ی سود ننویس. پیج فقط خبری است.
 - کلمات زرد و ترسناک مثل «بمب»، «انفجار»، «سکته» ممنوع.
-- نام پروژه یا کوین را یک‌بار به انگلیسی داخل پرانتز بیاور، مثل: اتریوم (ETH).
+- برای خبرهای رمزارز: نام پروژه یا کوین را یک‌بار به انگلیسی داخل پرانتز بیاور، مثل: اتریوم (ETH).
+- برای خبرهای بورس ایران: نماد شرکت را ذکر کن اگر مرتبط باشد.
+- برای خبرهای طلا/مسکن/خودرو: قیمت‌ها را به تومان بیاور اگر در متن هست.
 
 خروجی فقط یک JSON با این کلیدها:
 "headline": تیتر فارسی خیلی کوتاه و تیتروار برای روی تصویر؛ حداکثر ۷ کلمه و ۴۰ کاراکتر، بدون نقطه.
@@ -71,14 +115,15 @@ SYSTEM_WRITER = f"""تو سردبیر و نویسنده‌ی پیج خبری «�
   بعد یک سؤال برای کامنت، بعد خط «منبع: <نام منبع>». حداکثر ۳ ایموجی در کل متن. هشتگ داخل کپشن نگذار.
 "keywords": ۴ تا ۶ کلیدواژه‌ی فارسی که مردم جست‌وجو می‌کنند (بدون #)، به‌صورت آرایه.
 "hashtags": ۸ تا ۱۲ هشتگ فارسی و انگلیسی به‌صورت آرایه؛ هر هشتگ بدون فاصله و با _ (مثل #ارز_دیجیتال)، و حتماً {BRAND_HASHTAG}.
-"tag": یک کلمه یا نماد انگلیسی کوتاه برای پس‌زمینه‌ی تصویر وقتی عکس پیدا نشد (مثل "BTC" یا "ETF")، حداکثر ۸ حرف.
-"image_query": ۲ تا ۴ کلمه‌ی انگلیسی برای پیدا کردن عکس استوک مرتبط (مثل "bitcoin trading chart"). بدون نام شخص یا برند خاص.
+"tag": یک کلمه یا نماد انگلیسی کوتاه برای پس‌زمینه‌ی تصویر وقتی عکس پیدا نشد (مثل "BTC" یا "TEPIX" یا "GOLD")، حداکثر ۸ حرف.
+"image_query": ۲ تا ۴ کلمه‌ی انگلیسی برای پیدا کردن عکس استوک مرتبط (مثل "bitcoin trading chart" یا "gold coins bars" یا "apartment building"). بدون نام شخص یا برند خاص.
 """
 
 
 def write(item, body: str) -> dict:
     out = _claude(SYSTEM_WRITER,
-                  f"منبع: {item.source}\nتیتر اصلی: {item.title}\nلینک: {item.link}\n\n"
+                  f"منبع: {item.source}\nدسته‌بندی: {item.category}\n"
+                  f"تیتر اصلی: {item.title}\nلینک: {item.link}\n\n"
                   f"متن خبر:\n{body}", 1800)
     d = _json(out)
     tags = [t if t.startswith("#") else "#" + t for t in d.get("hashtags", [])]
