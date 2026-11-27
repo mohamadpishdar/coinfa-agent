@@ -110,12 +110,28 @@ def check() -> None:
                 skipped_dup += 1
                 continue
 
+            # Show "publishing..." on the message
+            try:
+                _call("editMessageText", data={
+                    "chat_id": chat, "message_id": msg["message_id"],
+                    "text": (msg_text + "\n\n— ⏳ در حال انتشار روی اینستاگرام...")[:4096]})
+            except Exception:
+                pass
+
             try:
                 link = instagram.publish_url(IBB + key, msg_text)
                 pub_time = datetime.now(TZ_BRUSSELS).strftime("%H:%M")
                 status = f"✅ منتشر شد ({pub_time}): {link}"
                 published += 1
                 published_keys.add(key)
+                # Send a separate notification message
+                headline = msg_text.split("\n")[0][:60]
+                try:
+                    _call("sendMessage", data={
+                        "chat_id": chat,
+                        "text": f"📢 پست منتشر شد!\n📰 {headline}\n🔗 {link}\n🕐 {pub_time}"})
+                except Exception:
+                    pass
             except Exception as e:
                 log.exception("publish failed")
                 status = f"⚠️ انتشار ناموفق: {str(e)[:200]}"
