@@ -65,6 +65,23 @@ def send(posts_file: str) -> None:
             log.exception("draft failed: %s", e)
             print("FAILED", p.get("link", ""), e)
 
+    # Send control panel after all drafts
+    now = datetime.now(TZ_BRUSSELS)
+    schedule = [h for h in range(10, 21)]
+    next_checks = [f"{h}:03" for h in schedule if
+                   now.replace(hour=h, minute=3, second=0) > now]
+    panel = (f"🎛 پنل کنترل CoinFa News\n\n"
+             f"📬 {len(posts)} خبر ارسال شد\n"
+             f"⏰ چک بعدی: {next_checks[0] if next_checks else 'فردا ۱۰:۰۳'}\n"
+             f"📅 زمان‌بندی: هر ساعت (:03) از ۱۰ تا ۲۰\n\n"
+             f"✅ روی خبرها بزنید → ساعت بعد منتشر میشه\n"
+             f"❌ رد کنید → حذف میشه")
+    kb = {"inline_keyboard": [[
+        {"text": "📊 وضعیت صف", "callback_data": "qstatus:"},
+    ]]}
+    _call("sendMessage", data={"chat_id": config.TELEGRAM_CHAT_ID, "text": panel,
+                               "reply_markup": json.dumps(kb)})
+
 
 def check() -> None:
     updates = _call("getUpdates", data={"timeout": 0,
@@ -93,8 +110,24 @@ def check() -> None:
         except Exception:
             pass
 
-        # Skip status button clicks
-        if action == "status":
+        # Handle status/qstatus button clicks
+        if action in ("status", "qstatus"):
+            # Count remaining pending approvals in this batch
+            pending = sum(1 for uu in updates
+                         if uu.get("callback_query", {}).get("data", "").startswith("ok:")
+                         and "✅ منتشر شد" not in uu.get("callback_query", {}).get("message", {}).get("text", ""))
+            now = datetime.now(TZ_BRUSSELS)
+            next_h = [f"{h}:03" for h in range(10, 21)
+                      if now.replace(hour=h, minute=3, second=0) > now]
+            reply = (f"📊 وضعیت صف\n\n"
+                     f"🕐 {now.strftime('%H:%M')} بروکسل\n"
+                     f"✅ {pending} پست در انتظار انتشار\n"
+                     f"⏰ انتشار بعدی: {next_h[0] if next_h else 'فردا ۱۰:۰۳'}\n"
+                     f"📬 {published} پست تا الان منتشر شد")
+            try:
+                _call("sendMessage", data={"chat_id": chat, "text": reply})
+            except Exception:
+                pass
             continue
 
         if action == "ok":
