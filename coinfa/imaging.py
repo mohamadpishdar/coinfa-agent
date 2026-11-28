@@ -1,307 +1,263 @@
-"""Compose the post image on the CoinFa template.
+"""Cloud mode: no always-on process and no local state.
 
-Layout (from assets/template.jpg, 864x1080, rendered at 1080x1350):
-  - top band: logo at left, headline to the right of the logo
-  - golden line at y≈195 (template px)
-  - below the line: a photo related to the story, cover-cropped
+    python cloud.py send posts.json   # build images, send drafts with ✅/❌ to Telegram
+    python cloud.py check             # publish every draft you approved since last check
+    python cloud.py status            # show pending/published/schedule info in the group
+
+posts.json is a list of objects written by the scheduled Claude session:
+  {"headline", "caption", "keywords", "hashtags", "tag", "image_query", "link", "source"}
+
+The approved image lives on imgbb (7-day expiry) and its path rides inside the button's
+callback data; the caption is the text of the message the buttons are attached to.
+So Telegram itself is the only state.
 """
-import io
-import time
+import json
 import logging
+import sys
+import uuid
+from datetime import datetime, timezone, timedelta
 
-import arabic_reshaper
 import requests
-from bidi.algorithm import get_display
-from PIL import Image, ImageDraw, ImageFont
 
-from .config import ASSETS, PEXELS_API_KEY, PIXABAY_API_KEY
+from coinfa import config, imaging, instagram, writer
+from coinfa.telegram import _call
 
-log = logging.getLogger(__name__)
-
-W, H = 1080, 1350
-S = W / 864                      # template -> output scale
-LINE_Y = int(197 * S)            # first row under the golden line
-TITLE_BOX = (int(228 * S), int(14 * S), W - int(26 * S), int(186 * S))
-FONT_BOLD = str(ASSETS / "Vazirmatn-Black.ttf")
-GOLD = (233, 196, 120)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("coinfa.cloud")
+IBB = "https://i.ibb.co/"
+TZ_BRUSSELS = timezone(timedelta(hours=1))
 
 
-from PIL import features
-
-_RAQM = features.check("raqm")
-
-
-def _font(size: int) -> ImageFont.FreeTypeFont:
-    # With libraqm, Pillow shapes Persian itself; otherwise we reshape + bidi.
-    eng = ImageFont.Layout.RAQM if _RAQM else ImageFont.Layout.BASIC
-    return ImageFont.truetype(FONT_BOLD, size, layout_engine=eng)
-
-
-def _rtl(text: str) -> str:
-    return text if _RAQM else get_display(arabic_reshaper.reshape(text))
+def _host(path: str) -> str:
+    with open(path, "rb") as f:
+        r = requests.post("https://api.imgbb.com/1/upload",
+                          params={"key": config.IMGBB_API_KEY, "expiration": 7 * 86400,
+                                  "name": "p"},
+                          files={"image": ("p.jpg", f, "image/jpeg")}, timeout=60)
+    r.raise_for_status()
+    return r.json()["data"]["url"]
 
 
-def _kw():
-    return {"direction": "rtl", "language": "fa"} if _RAQM else {}
-
-
-def _wrap(draw, words, font, max_w):
-    lines, cur = [], ""
-    for w in words:
-        test = f"{cur} {w}".strip()
-        if draw.textlength(_rtl(test), font=font, **_kw()) <= max_w or not cur:
-            cur = test
-        else:
-            lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-def _draw_headline(img: Image.Image, text: str) -> None:
-    d = ImageDraw.Draw(img)
-    x0, y0, x1, y1 = TITLE_BOX
-    bw, bh = x1 - x0, y1 - y0
-    words = text.split()
-    for size in range(78, 30, -2):
-        font = _font(size)
-        lines = _wrap(d, words, font, bw)
-        lh = int(size * 1.45)
-        if len(lines) <= 3 and lh * len(lines) <= bh:
-            break
-    total = lh * len(lines)
-    y = y0 + (bh - total) // 2
-    for ln in lines:
-        shown = _rtl(ln)
-        tw = d.textlength(shown, font=font, **_kw())
-        x = x1 - tw                                   # right-aligned (RTL)
-        d.text((x + 2, y + 3), shown, font=font, fill=(0, 0, 0), **_kw())   # soft shadow
-        d.text((x, y), shown, font=font, fill=(255, 255, 255), **_kw())
-        y += lh
-
-
-def _download(url: str) -> Image.Image:
-    return Image.open(io.BytesIO(requests.get(url, timeout=30).content)).convert("RGB")
-
-
-def _pixabay(query: str) -> Image.Image | None:
-    if not PIXABAY_API_KEY:
-        return None
-    try:
-        r = requests.get("https://pixabay.com/api/",
-                         params={"key": PIXABAY_API_KEY, "q": query[:100],
-                                 "image_type": "photo", "orientation": "vertical",
-                                 "safesearch": "true", "per_page": 5}, timeout=20)
-        hits = r.json().get("hits", [])
-        if not hits:
-            words = query.split()
-            return _pixabay(" ".join(words[:-1])) if len(words) > 1 else None
-        return _download(hits[0]["largeImageURL"])
-    except Exception as e:
-        log.warning("pixabay failed: %s", e)
-        return None
-
-
-_USED: set[str] = set()   # photo URLs already used in this run, to avoid repeats
-
-
-def _openverse(query: str) -> tuple[Image.Image | None, str]:
-    """Keyless: CC0 / public-domain / CC BY photographs from openverse.org.
-    Picks the largest usable photo among the top results; CC BY needs credit,
-    which we return and add to the caption."""
-    results = None
-    for _ in range(3):                      # the API is slow and sometimes answers 5xx
+def send(posts_file: str) -> None:
+    posts = json.load(open(posts_file, encoding="utf-8"))
+    for p in posts:
         try:
-            r = requests.get("https://api.openverse.org/v1/images/",
-                             params={"q": query[:100], "license": "cc0,pdm,by",
-                                     "category": "photograph", "page_size": 20},
-                             headers={"User-Agent": "CoinFaNewsBot/1.0"}, timeout=40)
-            if r.ok:
-                results = r.json().get("results", [])
-                break
-        except (requests.RequestException, ValueError):
-            pass
-        time.sleep(4)
-    if not results:
-        return None, ""
-    # biggest first; skip small or very wide/tall images
-    def good(x):
-        wdt, hgt = x.get("width") or 0, x.get("height") or 0
-        return wdt >= 900 and hgt >= 500 and 0.5 < wdt / max(hgt, 1) < 2.0
-    words = [w[:-1] if w.endswith("s") else w for w in query.lower().split() if len(w) > 2]
+            photo, credit = imaging.stock_photo(p.get("image_query", "cryptocurrency"),
+                                                       category=p.get("category", "crypto"))
+            out = config.OUT / f"{uuid.uuid4().hex[:8]}.jpg"
+            imaging.compose(p["headline"], photo, out, p.get("tag", ""))
+            caption = writer.full_caption(p, credit)
+            url = _host(str(out))
+            key = url[len(IBB):] if url.startswith(IBB) else ""
+            if not key or len(key) > 60:
+                raise RuntimeError(f"unexpected image url {url}")
+            with open(out, "rb") as f:
+                _call("sendPhoto", data={"chat_id": config.TELEGRAM_CHAT_ID,
+                                         "caption": f"📰 {p['headline']}\n🔗 {p.get('link', '')}"[:1024]},
+                      files={"photo": f})
+            kb = {"inline_keyboard": [[
+                {"text": "✅ تأیید و انتشار", "callback_data": f"ok:{key}"},
+                {"text": "❌ رد", "callback_data": "no:"},
+            ]]}
+            _call("sendMessage", data={"chat_id": config.TELEGRAM_CHAT_ID, "text": caption,
+                                       "reply_markup": json.dumps(kb)})
+            print("SENT", p.get("link", ""))
+        except Exception as e:
+            log.exception("draft failed: %s", e)
+            print("FAILED", p.get("link", ""), e)
 
-    def relevant(x):   # every query word must appear in the title or tags
-        text = (x.get("title") or "").lower() + " " + " ".join(
-            (t.get("name") or "").lower() for t in (x.get("tags") or []))
-        return all(w in text for w in words)
+    # Send control panel after all drafts
+    now = datetime.now(TZ_BRUSSELS)
+    schedule = [h for h in range(10, 21)]
+    next_checks = [f"{h}:03" for h in schedule if
+                   now.replace(hour=h, minute=3, second=0) > now]
+    panel = (f"🎛 پنل کنترل CoinFa News\n\n"
+             f"📬 {len(posts)} خبر ارسال شد\n"
+             f"⏰ چک بعدی: {next_checks[0] if next_checks else 'فردا ۱۰:۰۳'}\n"
+             f"📅 زمان‌بندی: هر ساعت (:03) از ۱۰ تا ۲۰\n\n"
+             f"✅ روی خبرها بزنید → ساعت بعد منتشر میشه\n"
+             f"❌ رد کنید → حذف میشه")
+    kb = {"inline_keyboard": [[
+        {"text": "📊 وضعیت صف", "callback_data": "qstatus:"},
+    ]]}
+    _call("sendMessage", data={"chat_id": config.TELEGRAM_CHAT_ID, "text": panel,
+                               "reply_markup": json.dumps(kb)})
 
-    # keep Openverse's own relevance order; skip repeats
-    ranked = [x for x in results if good(x) and relevant(x) and x.get("url") not in _USED]
-    for res in ranked[:8]:
+
+def check() -> None:
+    updates = _call("getUpdates", data={"timeout": 0,
+                                        "allowed_updates": json.dumps(["callback_query"])})
+    last = None
+    published = 0
+    skipped_dup = 0
+    published_keys = set()
+
+    for u in updates:
+        last = u["update_id"]
+        cq = u.get("callback_query")
+        if not cq:
+            continue
+        msg = cq.get("message", {})
+        chat = str(msg.get("chat", {}).get("id", ""))
+        if chat != str(config.TELEGRAM_CHAT_ID):
+            continue
+        action, _, key = cq.get("data", "").partition(":")
+        msg_text = msg.get("text", "")
+
+        # Answer the callback so Telegram stops showing the spinner
         try:
-            img = _download(res["url"])
+            _call("answerCallbackQuery", data={"callback_query_id": cq["id"],
+                                               "text": "در حال بررسی..."})
         except Exception:
+            pass
+
+        # Handle status/qstatus button clicks
+        if action in ("status", "qstatus"):
+            # Count remaining pending approvals in this batch
+            pending = sum(1 for uu in updates
+                         if uu.get("callback_query", {}).get("data", "").startswith("ok:")
+                         and "✅ منتشر شد" not in uu.get("callback_query", {}).get("message", {}).get("text", ""))
+            now = datetime.now(TZ_BRUSSELS)
+            next_h = [f"{h}:03" for h in range(10, 21)
+                      if now.replace(hour=h, minute=3, second=0) > now]
+            reply = (f"📊 وضعیت صف\n\n"
+                     f"🕐 {now.strftime('%H:%M')} بروکسل\n"
+                     f"✅ {pending} پست در انتظار انتشار\n"
+                     f"⏰ انتشار بعدی: {next_h[0] if next_h else 'فردا ۱۰:۰۳'}\n"
+                     f"📬 {published} پست تا الان منتشر شد")
+            try:
+                _call("sendMessage", data={"chat_id": chat, "text": reply})
+            except Exception:
+                pass
             continue
-        if img.width < 900 or img.height < 500:
-            continue
-        _USED.add(res["url"])
-        lic = (res.get("license") or "").lower()
-        credit = "" if lic in ("cc0", "pdm") else (
-            f"Photo: {res.get('creator') or 'unknown'} / "
-            f"CC {lic.upper()} {res.get('license_version') or ''} via Openverse").strip()
-        return img, credit
-    return None, ""
+
+        if action == "ok":
+            # GUARD 1: skip if this message was already published
+            if "✅ منتشر شد" in msg_text:
+                log.info("skipping already-published message %s", msg.get("message_id"))
+                skipped_dup += 1
+                continue
+
+            # GUARD 2: skip if same imgbb key already published in this run
+            if key in published_keys:
+                log.info("skipping duplicate key %s in same run", key)
+                skipped_dup += 1
+                continue
+
+            # Show "publishing..." on the message
+            try:
+                _call("editMessageText", data={
+                    "chat_id": chat, "message_id": msg["message_id"],
+                    "text": (msg_text + "\n\n— ⏳ در حال انتشار روی اینستاگرام...")[:4096]})
+            except Exception:
+                pass
+
+            try:
+                link = instagram.publish_url(IBB + key, msg_text)
+                pub_time = datetime.now(TZ_BRUSSELS).strftime("%H:%M")
+                status = f"✅ منتشر شد ({pub_time}): {link}"
+                published += 1
+                published_keys.add(key)
+                # Send a separate notification message
+                headline = msg_text.split("\n")[0][:60]
+                try:
+                    _call("sendMessage", data={
+                        "chat_id": chat,
+                        "text": f"📢 پست منتشر شد!\n📰 {headline}\n🔗 {link}\n🕐 {pub_time}"})
+                except Exception:
+                    pass
+            except Exception as e:
+                log.exception("publish failed")
+                status = f"⚠️ انتشار ناموفق: {str(e)[:200]}"
+        else:
+            status = "❌ رد شد"
+
+        data = {"chat_id": chat, "message_id": msg["message_id"],
+                "text": (msg_text + f"\n\n— {status}")[:4096]}
+        if status.startswith("⚠️") and msg.get("reply_markup"):
+            data["reply_markup"] = json.dumps(msg["reply_markup"])
+        try:
+            _call("editMessageText", data=data)
+        except Exception as e:
+            log.info("edit failed: %s", e)
+        print(status)
+
+    if last is not None:
+        _call("getUpdates", data={"offset": last + 1, "timeout": 0})
+    print(f"checked {len(updates)} updates, published {published}, skipped {skipped_dup} duplicates")
 
 
-def stock_photo(query: str) -> tuple[Image.Image | None, str]:
-    """Returns (image, credit line). `query` may hold alternatives separated by "|",
-    tried in order. Pixabay/Pexels if keys exist, else Openverse."""
-    if "|" in query:
-        for q in [q.strip() for q in query.split("|") if q.strip()]:
-            img, credit = stock_photo(q)
-            if img is not None:
-                return img, credit
-        return None, ""
-    img = _pixabay(query)
-    if img is not None:
-        return img, ""
-    if PEXELS_API_KEY:
-        img = _pexels(query)
-        if img is not None:
-            return img, ""
-    return _openverse(query)
+def status() -> None:
+    """Send a status report to the Telegram group."""
+    now = datetime.now(TZ_BRUSSELS)
 
-
-def _pexels(query: str) -> Image.Image | None:
+    # Get recent Instagram posts
+    token = config.IG_ACCESS_TOKEN
+    base = "graph.facebook.com" if token.startswith("EAA") else "graph.instagram.com"
     try:
-        r = requests.get("https://api.pexels.com/v1/search",
-                         headers={"Authorization": PEXELS_API_KEY},
-                         params={"query": query, "per_page": 8,
-                                 "orientation": "portrait"}, timeout=20)
-        photos = r.json().get("photos", [])
-        if not photos:
-            words = query.split()
-            if len(words) > 1:
-                return _pexels(" ".join(words[:-1]))
-            return None
-        return _download(photos[0]["src"]["large2x"])
-    except Exception as e:
-        log.warning("pexels failed: %s", e)
-        return None
+        url = f"https://{base}/{config.IG_API_VERSION}/{config.IG_USER_ID}/media"
+        r = requests.get(url, params={"access_token": token,
+                                       "fields": "timestamp,caption,permalink",
+                                       "limit": 5}, timeout=15)
+        recent = r.json().get("data", []) if r.ok else []
+    except Exception:
+        recent = []
 
+    # Next scheduled check times
+    schedule = [10, 12, 14, 16, 18, 20]
+    next_checks = []
+    for h in schedule:
+        t = now.replace(hour=h, minute=3, second=0, microsecond=0)
+        if t > now:
+            next_checks.append(t.strftime("%H:%M"))
+    if not next_checks:
+        next_checks = ["فردا ۱۰:۰۳"]
 
-def _fallback_photo(w, h, tag: str = "") -> Image.Image:
-    """Designed news graphic used when no stock photo is found:
-    glowing gradient, network lines, candlestick chart and a gold coin with the tag."""
-    import math
-    import random
-    from PIL import ImageFilter
-    rnd = random.Random(tag or "coinfa")
-    t = (tag or "").upper()
-    accent = {"HACK": (235, 70, 70), "BUG": (235, 70, 70), "SEC": (90, 160, 255),
-              "ETF": (80, 170, 255), "LAW": (90, 160, 255)}.get(t, (240, 185, 60))
-    # background: vertical gradient + soft glow behind the coin
-    g = Image.new("RGB", (w, h))
-    d = ImageDraw.Draw(g)
-    for y in range(h):
-        k = y / h
-        d.line([(0, y), (w, y)], fill=(int(10 + 14 * (1 - k)), int(16 + 20 * (1 - k)), int(32 + 30 * (1 - k))))
-    glow = Image.new("RGB", (w, h), (0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    cx, cy, r = w // 2, int(h * 0.40), int(min(w, h) * 0.23)
-    gd.ellipse([cx - r * 2, cy - r * 2, cx + r * 2, cy + r * 2], fill=tuple(int(c * 0.55) for c in accent))
-    glow = glow.filter(ImageFilter.GaussianBlur(140))
-    g = Image.blend(g, Image.composite(glow, g, glow.convert("L")), 0.85)
-    d = ImageDraw.Draw(g, "RGBA")
-    # network: faint nodes and links
-    pts = [(rnd.randint(0, w), rnd.randint(0, int(h * 0.75))) for _ in range(26)]
-    for i, a in enumerate(pts):
-        for b in pts[i + 1:]:
-            if math.dist(a, b) < 230:
-                d.line([a, b], fill=(*accent, 38), width=2)
-    for x, y in pts:
-        d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(*accent, 110))
-    # candlestick chart along the bottom
-    base_y, price, n = int(h * 0.80), 0.0, 26
-    cw = w / n
-    trend = -1 if t in ("HACK", "BUG") else (rnd.choice([-1, 1]))
-    series = []
-    for i in range(n):
-        o = price
-        price += rnd.uniform(-1, 1) * 18 + trend * 4
-        series.append((o, price))
-    lo = min(min(a, b) for a, b in series); hi = max(max(a, b) for a, b in series)
-    span = max(hi - lo, 1)
-    def Y(v): return base_y - (v - lo) / span * h * 0.22
-    for i, (o, c) in enumerate(series):
-        x0 = int(i * cw + cw * 0.25); x1 = int(i * cw + cw * 0.75)
-        col = (60, 200, 120, 150) if c >= o else (230, 80, 80, 150)
-        d.line([((x0 + x1) // 2, Y(max(o, c)) - rnd.randint(4, 18)),
-                ((x0 + x1) // 2, Y(min(o, c)) + rnd.randint(4, 18))], fill=col, width=3)
-        d.rectangle([x0, min(Y(o), Y(c)), x1, max(Y(o), Y(c)) + 2], fill=col)
-    # gold coin with the tag
-    for i in range(r, 0, -1):
-        k = i / r
-        col = (int(150 + 100 * (1 - k)), int(105 + 85 * (1 - k)), int(30 + 40 * (1 - k)))
-        d.ellipse([cx - i, cy - i, cx + i, cy + i], fill=col)
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(255, 225, 140), width=6)
-    d.ellipse([cx - r + 22, cy - r + 22, cx + r - 22, cy + r - 22], outline=(120, 80, 20), width=4)
-    if t:
-        size = int(r * 0.9)
-        while size > 30:
-            f = ImageFont.truetype(FONT_BOLD, size)
-            if d.textlength(t, font=f) < r * 1.45:
-                break
-            size -= 6
-        bb = d.textbbox((0, 0), t, font=f)
-        tx, ty = cx - (bb[2] - bb[0]) / 2 - bb[0], cy - (bb[3] - bb[1]) / 2 - bb[1]
-        d.text((tx + 3, ty + 4), t, font=f, fill=(90, 60, 10))
-        d.text((tx, ty), t, font=f, fill=(255, 245, 210))
-    # bottom fade
-    for y in range(int(h * 0.85), h):
-        a = int(200 * (y - h * 0.85) / (h * 0.15))
-        d.line([(0, y), (w, y)], fill=(8, 12, 24, a))
-    return g
+    # Check pending updates (peek without consuming)
+    updates = _call("getUpdates", data={"timeout": 0,
+                                        "allowed_updates": json.dumps(["callback_query"])})
+    pending = []
+    for u in updates:
+        cq = u.get("callback_query", {})
+        if cq.get("data", "").startswith("ok:"):
+            msg_text = cq.get("message", {}).get("text", "")
+            if "✅ منتشر شد" not in msg_text:
+                headline = msg_text.split("\n")[0][:50]
+                pending.append(headline)
 
+    # Build status message
+    lines = ["📊 وضعیت CoinFa News\n"]
+    lines.append(f"🕐 {now.strftime('%Y-%m-%d %H:%M')} بروکسل")
+    lines.append(f"⏰ چک بعدی: {', '.join(next_checks[:3])}")
+    lines.append(f"📅 روزانه ساعت: {', '.join(str(h) + ':03' for h in schedule)}")
 
-def _landscape(photo: Image.Image, w: int, h: int) -> Image.Image:
-    """Wide photo: sharp full-width copy over a blurred, darkened fill of itself."""
-    from PIL import ImageEnhance, ImageFilter
-    bg = _cover(photo, w, h).filter(ImageFilter.GaussianBlur(28))
-    bg = ImageEnhance.Brightness(bg).enhance(0.45)
-    fg = photo.resize((w, int(photo.height * w / photo.width)), Image.LANCZOS)
-    y = (h - fg.height) // 2 - int(h * 0.04)
-    bg.paste(fg, (0, max(y, 0)))
-    d = ImageDraw.Draw(bg)
-    d.line([(0, y - 2), (w, y - 2)], fill=GOLD, width=3)
-    d.line([(0, y + fg.height + 1), (w, y + fg.height + 1)], fill=GOLD, width=3)
-    return bg
+    if recent:
+        lines.append(f"\n📱 آخرین پست‌های اینستاگرام:")
+        for m in recent:
+            ts = m.get("timestamp", "")[:16].replace("T", " ")
+            caption = (m.get("caption") or "")[:40].replace("\n", " ")
+            lines.append(f"  • {ts} — {caption}...")
 
-
-def _cover(photo: Image.Image, w: int, h: int) -> Image.Image:
-    r = max(w / photo.width, h / photo.height)
-    p = photo.resize((int(photo.width * r) + 1, int(photo.height * r) + 1), Image.LANCZOS)
-    left = (p.width - w) // 2
-    top = max(0, (p.height - h) // 3)               # bias toward upper part
-    return p.crop((left, top, left + w, top + h))
-
-
-def compose(headline: str, photo: Image.Image | None, out_path, tag: str = "") -> str:
-    base = Image.open(ASSETS / "template.jpg").convert("RGB").resize((W, H), Image.LANCZOS)
-    ph_h = H - LINE_Y
-    if photo is None:
-        ph = _fallback_photo(W, ph_h, tag)
-    elif photo.width / photo.height > 1.1:
-        ph = _landscape(photo, W, ph_h)
+    if pending:
+        lines.append(f"\n✅ {len(pending)} پست در صف انتشار:")
+        for h in pending:
+            lines.append(f"  • {h}")
+        lines.append(f"🕐 انتشار در: {next_checks[0] if next_checks else 'نامشخص'}")
     else:
-        ph = _cover(photo, W, ph_h)
-    # fade the photo's top edge into the dark band for a clean join
-    mask = Image.new("L", (W, ph_h), 255)
-    md = ImageDraw.Draw(mask)
-    for i in range(40):
-        md.line([(0, i), (W, i)], fill=int(120 + 135 * i / 40))
-    base.paste(ph, (0, LINE_Y), mask)
-    _draw_headline(base, headline)
-    base.save(out_path, "JPEG", quality=92, optimize=True)
-    return str(out_path)
+        lines.append("\n📭 صف انتشار خالیست")
+        lines.append("💡 روی پست‌های جدید دکمه ✅ بزنید")
+
+    _call("sendMessage", data={"chat_id": config.TELEGRAM_CHAT_ID,
+                               "text": "\n".join(lines)})
+    print("Status sent")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "send":
+        send(sys.argv[2])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "check":
+        check()
+    elif len(sys.argv) >= 2 and sys.argv[1] == "status":
+        status()
+    else:
+        sys.exit(__doc__)
