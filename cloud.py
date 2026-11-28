@@ -42,7 +42,8 @@ def send(posts_file: str) -> None:
     posts = json.load(open(posts_file, encoding="utf-8"))
     for p in posts:
         try:
-            photo, credit = imaging.stock_photo(p.get("image_query", "cryptocurrency"))
+            photo, credit = imaging.stock_photo(p.get("image_query", "cryptocurrency"),
+                                                       category=p.get("category", "crypto"))
             out = config.OUT / f"{uuid.uuid4().hex[:8]}.jpg"
             imaging.compose(p["headline"], photo, out, p.get("tag", ""))
             caption = writer.full_caption(p, credit)
